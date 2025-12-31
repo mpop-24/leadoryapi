@@ -43,12 +43,13 @@ worker_thread: Optional[threading.Thread] = None
 def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL", "").strip()
     if database_url:
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace("postgres://", "postgresql://", 1)
         return database_url
+
     fallback = "sqlite:///./leadory.db"
     print("WARNING: DATABASE_URL is not set; using local sqlite database for dev.")
     return fallback
-
-
 engine = create_engine(get_database_url(), echo=False)
 
 
