@@ -15,7 +15,6 @@ from typing import Any, List, Optional
 import httpx
 import jwt
 from fastapi import (
-    BackgroundTasks,
     Body,
     Depends,
     FastAPI,
@@ -25,8 +24,9 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import EmailStr
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import UniqueConstraint, inspect, text
 
 RATE_LIMIT_MAX = 10
 RATE_LIMIT_WINDOW_SEC = 60
@@ -40,16 +40,24 @@ worker_thread: Optional[threading.Thread] = None
 # ------------------------------------------------------------------------------
 # DB setup
 # ------------------------------------------------------------------------------
+def normalize_database_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    if url.startswith("postgresql://") and "+psycopg" not in url and "+psycopg2" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
+
+
 def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL", "").strip()
     if database_url:
-        if database_url.startswith("postgres://"):
-            database_url = database_url.replace("postgres://", "postgresql://", 1)
-        return database_url
+        return normalize_database_url(database_url)
 
     fallback = "sqlite:///./leadory.db"
     print("WARNING: DATABASE_URL is not set; using local sqlite database for dev.")
     return fallback
+
+
 engine = create_engine(get_database_url(), echo=False)
 
 
@@ -60,6 +68,33 @@ def get_session() -> Session:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def ensure_schema() -> None:
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+
+    if "client" in table_names:
+        client_columns = {col["name"] for col in inspector.get_columns("client")}
+        missing_client_columns = []
+        if "pricing" not in client_columns:
+            missing_client_columns.append("ADD COLUMN pricing TEXT")
+        if "business_description" not in client_columns:
+            missing_client_columns.append("ADD COLUMN business_description TEXT")
+        if "sign_off_name" not in client_columns:
+            missing_client_columns.append("ADD COLUMN sign_off_name VARCHAR(255)")
+        if "mimic_email" not in client_columns:
+            missing_client_columns.append("ADD COLUMN mimic_email VARCHAR(255)")
+        if "inquiry_email" not in client_columns:
+            missing_client_columns.append("ADD COLUMN inquiry_email VARCHAR(255)")
+
+        if missing_client_columns:
+            with engine.begin() as conn:
+                for clause in missing_client_columns:
+                    try:
+                        conn.execute(text(f"ALTER TABLE client {clause}"))
+                    except Exception as exc:
+                        print(f"Schema migration warning (client): {clause}: {exc}")
 
 
 # ------------------------------------------------------------------------------
@@ -79,9 +114,14 @@ class Client(TimestampMixin, SQLModel, table=True):
     is_active: bool = Field(default=True, index=True)
     inbound_address: str = Field(unique=True, index=True)
     from_email: str
+    inquiry_email: Optional[EmailStr] = Field(default=None, index=True)
     reply_to_email: Optional[str] = None
     cc_email: Optional[str] = None
     slack_webhook_url: Optional[str] = None
+    pricing: Optional[str] = None
+    business_description: Optional[str] = None
+    sign_off_name: Optional[str] = Field(default=None, max_length=255)
+    mimic_email: Optional[EmailStr] = Field(default=None, index=True)
 
 
 class InboundEmail(TimestampMixin, SQLModel, table=True):
@@ -103,6 +143,19 @@ class InboundEmail(TimestampMixin, SQLModel, table=True):
         UniqueConstraint("client_id", "provider_message_id", name="uq_client_message"),
     )
 
+
+class Lead(TimestampMixin, SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    client_id: int = Field(foreign_key="client.id", index=True)
+    name: Optional[str] = None
+    email: Optional[EmailStr] = Field(default=None, index=True)
+    phone: Optional[str] = None
+    message_text: Optional[str] = None
+    meta_json: Optional[str] = None
+    email_status: str = Field(default="pending", index=True)
+    slack_status: str = Field(default="pending", index=True)
+    error_email: Optional[str] = None
+    error_slack: Optional[str] = None
 
 # ------------------------------------------------------------------------------
 # App init
@@ -127,6 +180,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     SQLModel.metadata.create_all(engine)
+    ensure_schema()
     start_worker()
 
 
@@ -230,6 +284,27 @@ def rate_limit(ip: str) -> None:
     rate_limits[ip] = hits
 
 
+def log_event(correlation_id: str, event: str, **fields: Any) -> None:
+    payload = {"correlation_id": correlation_id, "event": event}
+    payload.update(fields)
+    try:
+        print(json.dumps(payload, separators=(",", ":"), default=str))
+    except Exception:
+        print({"correlation_id": correlation_id, "event": event, "fields": fields})
+
+
+def sanitize_header(value: str) -> str:
+    return value.replace("\r", " ").replace("\n", " ").strip()
+
+
+def resolve_from_email() -> Optional[str]:
+    for env_key in ["FROM_EMAIL", "SENDGRID_FROM_EMAIL", "VERIFIED_SENDER_EMAIL"]:
+        candidate = os.getenv(env_key, "").strip()
+        if candidate:
+            return sanitize_header(candidate)
+    return None
+
+
 # ------------------------------------------------------------------------------
 # SendGrid / AI helpers
 # ------------------------------------------------------------------------------
@@ -315,11 +390,10 @@ def generate_reply(text: str, client: Client) -> str:
 
 
 def send_slack_notification(webhook_url: str, message: str) -> None:
-    try:
-        with httpx.Client(timeout=5.0) as client:
-            client.post(webhook_url, json={"text": message})
-    except Exception:
-        pass
+    with httpx.Client(timeout=5.0) as client:
+        resp = client.post(webhook_url, json={"text": message})
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Slack response {resp.status_code}: {resp.text}")
 
 
 def send_sendgrid_email(
@@ -327,21 +401,30 @@ def send_sendgrid_email(
     inbound: InboundEmail,
     body: str,
 ) -> None:
-    api_key = os.getenv("SENDGRID_API_KEY", "")
+    api_key = os.getenv("SENDGRID_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("SENDGRID_API_KEY is required to send email.")
 
-    if client.from_email.endswith(f"@{inbound_domain()}") and not client.reply_to_email:
+    from_email = resolve_from_email() or client.from_email
+    if not from_email:
+        raise RuntimeError("MISSING_FROM_EMAIL")
+    from_email = sanitize_header(from_email)
+    to_email = sanitize_header(inbound.from_email)
+    subject = (
+        sanitize_header(f"Re: {inbound.subject}") if inbound.subject else "Re: Your inquiry"
+    )
+
+    if from_email.endswith(f"@{inbound_domain()}") and not client.reply_to_email:
         raise RuntimeError("reply_to_email is required when using Leadory sending domain.")
 
     payload: dict[str, Any] = {
         "personalizations": [
             {
-                "to": [{"email": inbound.from_email}],
-                "subject": f"Re: {inbound.subject}" if inbound.subject else "Re: Your inquiry",
+                "to": [{"email": to_email}],
+                "subject": subject,
             }
         ],
-        "from": {"email": client.from_email},
+        "from": {"email": from_email},
         "content": [{"type": "text/plain", "value": body}],
         "headers": {
             "X-Leadory-Client-ID": str(client.id),
@@ -479,6 +562,18 @@ async def health() -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.get("/health/email")
+async def health_email() -> JSONResponse:
+    api_key = os.getenv("SENDGRID_API_KEY", "").strip()
+    from_email = resolve_from_email()
+    status_ok = bool(api_key and from_email)
+    detail = {
+        "sendgrid_key": bool(api_key),
+        "from_email": from_email,
+    }
+    return JSONResponse({"ok": status_ok, **detail})
+
+
 @app.post("/admin/login")
 async def admin_login(
     request: Request,
@@ -525,9 +620,14 @@ class ClientCreate(SQLModel):
     name: str
     company_slug: str
     from_email: str
+    inquiry_email: Optional[EmailStr] = None
     reply_to_email: Optional[str] = None
     cc_email: Optional[str] = None
     slack_webhook_url: Optional[str] = None
+    pricing: Optional[str] = None
+    business_description: Optional[str] = None
+    sign_off_name: Optional[str] = None
+    mimic_email: Optional[EmailStr] = None
     is_active: bool = True
     inbound_address: Optional[str] = None
 
@@ -536,9 +636,14 @@ class ClientUpdate(SQLModel):
     name: Optional[str] = None
     company_slug: Optional[str] = None
     from_email: Optional[str] = None
+    inquiry_email: Optional[EmailStr] = None
     reply_to_email: Optional[str] = None
     cc_email: Optional[str] = None
     slack_webhook_url: Optional[str] = None
+    pricing: Optional[str] = None
+    business_description: Optional[str] = None
+    sign_off_name: Optional[str] = None
+    mimic_email: Optional[EmailStr] = None
     is_active: Optional[bool] = None
     inbound_address: Optional[str] = None
 
@@ -577,11 +682,18 @@ async def create_client(
         name=payload.name.strip(),
         company_slug=slug,
         from_email=payload.from_email.strip(),
+        inquiry_email=payload.inquiry_email,
         reply_to_email=payload.reply_to_email.strip() if payload.reply_to_email else None,
         cc_email=payload.cc_email.strip() if payload.cc_email else None,
         slack_webhook_url=payload.slack_webhook_url.strip()
         if payload.slack_webhook_url
         else None,
+        pricing=payload.pricing.strip() if payload.pricing else None,
+        business_description=payload.business_description.strip()
+        if payload.business_description
+        else None,
+        sign_off_name=payload.sign_off_name.strip() if payload.sign_off_name else None,
+        mimic_email=payload.mimic_email,
         is_active=payload.is_active,
         inbound_address=temp_inbound,
     )
@@ -643,6 +755,16 @@ async def update_client(
     return client
 
 
+@app.patch("/admin/clients/{client_id}", response_model=Client)
+async def patch_client(
+    request: Request,
+    client_id: int,
+    payload: ClientUpdate,
+    session: Session = Depends(get_session),
+) -> Client:
+    return await update_client(request, client_id, payload, session)
+
+
 @app.get("/admin/clients", response_model=List[Client])
 async def list_clients(
     request: Request,
@@ -651,6 +773,19 @@ async def list_clients(
     require_admin(request)
     clients = session.exec(select(Client).order_by(Client.created_at.desc())).all()
     return clients
+
+
+@app.get("/admin/clients/{client_id}", response_model=Client)
+async def get_client(
+    request: Request,
+    client_id: int,
+    session: Session = Depends(get_session),
+) -> Client:
+    require_admin(request)
+    client = session.get(Client, client_id)
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+    return client
 
 
 @app.post("/admin/clients/{client_id}/toggle")
@@ -755,11 +890,12 @@ async def sendgrid_inbound(
 async def submit_lead(
     company_slug: str,
     request: Request,
-    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
 ) -> JSONResponse:
+    correlation_id = secrets.token_hex(8)
     ip = request.client.host if request.client else "unknown"
     rate_limit(ip)
+    log_event(correlation_id, "LEAD_RECEIVED", company_slug=company_slug, ip=ip)
 
     try:
         data = await request.json()
@@ -768,57 +904,184 @@ async def submit_lead(
         data = dict(form)
 
     name = str(data.get("name", "")).strip()
-    email = str(data.get("email", "")).strip()
+    email = str(data.get("email", "")).strip() or None
     phone = str(data.get("phone", "")).strip() if data.get("phone") is not None else None
     message_text = str(data.get("message", "")).strip() if data.get("message") is not None else ""
     meta = data.get("meta")
-    subject = f"New lead from {name}" if name else "New lead"
+    user_agent = request.headers.get("user-agent", "")
 
     client = session.exec(
         select(Client).where(Client.company_slug == company_slug.lower())
     ).first()
     if not client or not client.is_active:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+    if not client.inquiry_email:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Client missing inquiry_email",
+        )
 
-    body_parts = [
-        f"Name: {name}",
-        f"Email: {email}",
+    meta_payload = {"ip": ip, "user_agent": user_agent}
+    if meta is not None:
+        meta_payload["meta"] = meta
+
+    lead = Lead(
+        client_id=client.id,
+        name=name,
+        email=email,
+        phone=phone,
+        message_text=message_text,
+        meta_json=json.dumps(meta_payload),
+        email_status="pending",
+        slack_status="pending",
+    )
+    session.add(lead)
+    session.commit()
+    session.refresh(lead)
+    log_event(correlation_id, "LEAD_SAVED", lead_id=lead.id, client_id=client.id)
+
+    from_email = resolve_from_email()
+    if not from_email:
+        lead.email_status = "failed"
+        lead.error_email = "MISSING_FROM_EMAIL"
+        session.add(lead)
+        session.commit()
+        log_event(correlation_id, "EMAIL_SEND_RESULT", status="failed", error="MISSING_FROM_EMAIL")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Missing verified FROM email",
+        )
+
+    api_key = os.getenv("SENDGRID_API_KEY", "").strip()
+    if not api_key:
+        lead.email_status = "failed"
+        lead.error_email = "MISSING_SENDGRID_API_KEY"
+        session.add(lead)
+        session.commit()
+        log_event(correlation_id, "EMAIL_SEND_RESULT", status="failed", error="missing API key")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Missing SENDGRID_API_KEY",
+        )
+
+    sanitized_to = sanitize_header(str(client.inquiry_email))
+    subject = sanitize_header(f"New lead from {name}" if name else "New lead")
+
+    body_lines = [
+        f"Client: {client.name}",
+        f"Lead name: {name or 'N/A'}",
+        f"Lead email: {email or 'N/A'}",
     ]
     if phone:
-        body_parts.append(f"Phone: {phone}")
+        body_lines.append(f"Phone: {phone}")
     if message_text:
-        body_parts.append(f"Message: {message_text}")
+        body_lines.append(f"Message:\n{message_text}")
+    if client.business_description:
+        body_lines.append(f"\nAbout the business:\n{client.business_description}")
+    if client.pricing:
+        body_lines.append(f"\nPricing:\n{client.pricing}")
     if meta is not None:
-        body_parts.append(f"Meta: {json.dumps(meta)}")
-    body = "\n".join(body_parts)
+        body_lines.append(f"\nMeta: {json.dumps(meta)}")
+    if client.sign_off_name:
+        body_lines.append(f"\n{client.sign_off_name}")
 
-    provider_message_id = compute_provider_message_id(
-        client.inbound_address, email, subject, body
-    )
-    existing = session.exec(
-        select(InboundEmail).where(
-            InboundEmail.client_id == client.id,
-            InboundEmail.provider_message_id == provider_message_id,
+    email_payload: dict[str, Any] = {
+        "personalizations": [{"to": [{"email": sanitized_to}]}],
+        "from": {"email": from_email},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": "\n".join(body_lines)}],
+    }
+
+    log_event(correlation_id, "EMAIL_SEND_ATTEMPT", to=sanitized_to)
+    try:
+        with httpx.Client(timeout=10.0) as client_http:
+            resp = client_http.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps(email_payload),
+            )
+    except Exception as exc:
+        lead.email_status = "failed"
+        lead.error_email = str(exc)
+        session.add(lead)
+        session.commit()
+        log_event(correlation_id, "EMAIL_SEND_RESULT", status="failed", error=str(exc))
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Email send failed")
+
+    if resp.status_code >= 300:
+        lead.email_status = "failed"
+        lead.error_email = f"SendGrid {resp.status_code}: {resp.text}"
+        session.add(lead)
+        session.commit()
+        log_event(
+            correlation_id,
+            "EMAIL_SEND_RESULT",
+            status="failed",
+            status_code=resp.status_code,
+            body=resp.text,
         )
-    ).first()
-    if existing:
-        return JSONResponse({"ok": True, "detail": "Already processed"})
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Email rejected by provider",
+        )
 
-    inbound_email = InboundEmail(
-        client_id=client.id,
-        provider="sendgrid",
-        provider_message_id=provider_message_id,
-        from_email=email,
-        to_email=client.inbound_address,
-        subject=subject,
-        body_text=body,
-    )
-    session.add(inbound_email)
+    lead.email_status = "sent"
+    session.add(lead)
     session.commit()
-    session.refresh(inbound_email)
+    log_event(
+        correlation_id,
+        "EMAIL_SEND_RESULT",
+        status="sent",
+        status_code=resp.status_code,
+    )
 
-    enqueue_inbound_processing(inbound_email.id)
-    return JSONResponse({"ok": True, "inbound_id": inbound_email.id})
+    slack_webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip() or client.slack_webhook_url
+    if slack_webhook:
+        slack_message = (
+            f"New lead for {client.name}\n"
+            f"Name: {name or 'N/A'}\n"
+            f"Email: {email or 'N/A'}\n"
+            f"Phone: {phone or 'N/A'}\n"
+            f"Message: {message_text or 'N/A'}"
+        )
+        log_event(correlation_id, "SLACK_SEND_ATTEMPT")
+        try:
+            with httpx.Client(timeout=5.0) as client_http:
+                slack_resp = client_http.post(slack_webhook, json={"text": slack_message})
+            if slack_resp.status_code >= 300:
+                lead.slack_status = "failed"
+                lead.error_slack = f"Slack {slack_resp.status_code}: {slack_resp.text}"
+                log_event(
+                    correlation_id,
+                    "SLACK_SEND_RESULT",
+                    status="failed",
+                    status_code=slack_resp.status_code,
+                    body=slack_resp.text,
+                )
+            else:
+                lead.slack_status = "sent"
+                log_event(
+                    correlation_id,
+                    "SLACK_SEND_RESULT",
+                    status="sent",
+                    status_code=slack_resp.status_code,
+                )
+        except Exception as exc:
+            lead.slack_status = "failed"
+            lead.error_slack = str(exc)
+            log_event(correlation_id, "SLACK_SEND_RESULT", status="failed", error=str(exc))
+    else:
+        lead.slack_status = "failed"
+        lead.error_slack = "Missing Slack webhook URL"
+        log_event(correlation_id, "SLACK_SEND_RESULT", status="failed", error="missing webhook")
+
+    session.add(lead)
+    session.commit()
+
+    return JSONResponse({"ok": True, "lead_id": lead.id})
 
 
 if __name__ == "__main__":
