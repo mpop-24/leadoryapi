@@ -34,16 +34,14 @@ export ENCRYPTION_KEY=<32-byte-hex-or-base64>
 # set provider envs as above
 alembic upgrade head
 uvicorn main:app --host 0.0.0.0 --port 8000
-# in separate shells:
+# worker (includes scheduler) in a separate shell:
 python -m worker.worker
-python -m worker.scheduler
 ```
 
 Processes
 ---------
 - Web API: `uvicorn main:app`
-- Worker: `python -m worker.worker` (processes job table)
-- Scheduler: `python -m worker.scheduler` (enqueues poll/renew jobs)
+- Worker (includes scheduler): `python -m worker.worker`
 
 Endpoints (admin routes require bearer token)
 ---------------------------------------------
