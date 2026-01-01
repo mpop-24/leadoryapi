@@ -1,45 +1,26 @@
-Leadory Email Engine
-====================
+Connected Inbox Lead Assistant
+==============================
 
-Minimal FastAPI + Postgres service for ingesting inbound emails per client, classifying, and replying via SendGrid. All client configuration lives in the database.
+FastAPI + SQLModel + Postgres service that connects to real mailboxes (Gmail/Outlook) via OAuth, ingests inbound leads, drafts AI replies, auto-sends from the connected inbox, and notifies Slack. Webhooks with polling fallback, encrypted tokens, and a DB-backed job queue/worker.
 
 Requirements
 ------------
 - Python 3.12+
 - Postgres database
-- SendGrid account (Inbound Parse + Mail Send)
-- OpenAI API key (for classification + reply generation)
+- Google/Microsoft OAuth apps configured (see below)
+- Optional: OpenAI API key (for AI drafts), Slack webhook
 
 Environment Variables
 ---------------------
-- `DATABASE_URL` — Postgres connection string (e.g. `postgresql+psycopg://user:pass@host:5432/db`)
-- `SENDGRID_API_KEY` — SendGrid API key with Mail Send + Inbound Parse permissions
-- `INBOUND_WEBHOOK_SECRET` — shared secret required by `/webhooks/sendgrid/inbound`
-- `INBOUND_EMAIL_DOMAIN` — domain for inbound addresses (default `inbound.leadory.co`)
-- `OPENAI_KEY` — OpenAI API key
-- `ADMIN_USERNAME`, `ADMIN_PASSWORD` — dashboard/admin login
-- `JWT_SECRET` — secret for issuing admin tokens
-- Optional: `ADMIN_KEY` (header override), `JWT_EXPIRES_SECONDS`
+- Core: `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `JWT_SECRET`, `DATABASE_URL`, `ENCRYPTION_KEY`, `CORS_ORIGINS`, `BASE_URL`
+- Gmail: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI`, `GOOGLE_PUBSUB_TOPIC`, `GOOGLE_PUBSUB_AUDIENCE`, `GMAIL_WEBHOOK_SECRET`
+- Microsoft: `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, `MICROSOFT_OAUTH_REDIRECT_URI`, `MICROSOFT_TENANT`, `MICROSOFT_SUBSCRIPTION_CLIENT_STATE_SECRET`, `MICROSOFT_NOTIFICATION_URL`
+- Optional: `OPENAI_API_KEY`, `SLACK_WEBHOOK_URL`
 
-Database Models
----------------
-- **Client**: name, `company_slug`, `is_active`, `inbound_address`, `from_email`, optional `reply_to_email`, `cc_email`, `slack_webhook_url`, timestamps.
-- **InboundEmail**: `client_id`, provider (`sendgrid`), `provider_message_id`, `from_email`, `to_email`, subject, body, `received_at`, classification (`YES/NO/ERROR`), reply_status (`SENT/SKIPPED/FAILED`), timestamps, optional `error`. Unique `(client_id, provider_message_id)`.
-
-SendGrid Inbound Parse Setup
-----------------------------
-1. Configure domain/MX: point `inbound.leadory.co` MX to SendGrid Inbound Parse per SendGrid docs.
-2. Inbound Parse settings:
-   - Hostname: `inbound.leadory.co`
-   - URL: `https://<your-domain>/webhooks/sendgrid/inbound?secret=INBOUND_WEBHOOK_SECRET`
-   - Spam check disabled; POST format `multipart/form-data`.
-3. Each client uses an address like `client_<id>@inbound.leadory.co`. Leads should forward/route to that address.
-
-SendGrid Outbound Sending
--------------------------
-- Verify a Sender Identity or domain authenticate the sending domain for `from_email`.
-- Mail send uses SendGrid v3 API with headers `X-Leadory-Client-ID` and `X-Leadory-Inbound-ID`.
-- If sending from the Leadory domain, configure `reply_to_email` so customer replies go to the client owner.
+OAuth Setup
+-----------
+- Gmail: Create OAuth client (web), add redirect URI, enable Gmail API. Create Pub/Sub topic + push subscription to `/webhooks/gmail/push` with audience/secret.
+- Microsoft: Register app, scopes Mail.ReadWrite/Mail.Send, add redirect URI. Configure notification URL `/webhooks/microsoft/notifications`; set clientState secret.
 
 Running Locally
 ---------------
@@ -47,42 +28,41 @@ Running Locally
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+export ADMIN_USERNAME=admin ADMIN_PASSWORD=pass JWT_SECRET=devjwt
 export DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/leadory
-export SENDGRID_API_KEY=...
-export INBOUND_WEBHOOK_SECRET=dev-secret
-export OPENAI_KEY=...
-export ADMIN_USERNAME=admin ADMIN_PASSWORD=pass JWT_SECRET=jwtsecret
-uvicorn main:app --reload --port 8000
+export ENCRYPTION_KEY=<32-byte-hex-or-base64>
+# set provider envs as above
+alembic upgrade head
+uvicorn main:app --host 0.0.0.0 --port 8000
+# in separate shells:
+python -m worker.worker
+python -m worker.scheduler
 ```
 
-Sample Inbound Webhook Test
----------------------------
-```bash
-curl -X POST "http://localhost:8000/webhooks/sendgrid/inbound?secret=dev-secret" \
-  -F "from=lead@example.com" \
-  -F "to=client_1@inbound.leadory.co" \
-  -F "subject=Test Lead" \
-  -F "text=Hello, I want to buy your product" \
-  -F "headers=Message-ID: <test123@example.com>"
-```
-Response returns quickly; processing happens in background.
+Processes
+---------
+- Web API: `uvicorn main:app`
+- Worker: `python -m worker.worker` (processes job table)
+- Scheduler: `python -m worker.scheduler` (enqueues poll/renew jobs)
 
-Admin & Dashboard Endpoints
----------------------------
-- `POST /admin/login` — get bearer token
-- `GET /admin/clients` — list clients
-- `POST /admin/clients` — create client (auto-generates inbound address if omitted)
-- `PUT /admin/clients/{id}` — update client fields
-- `POST /admin/clients/{id}/toggle` — pause/resume
-- `GET /admin/inbound-emails` — recent inbound emails (optional `client_id`)
-
-Embed/Form Routing
-------------------
-- Use `company_slug` to build embed URLs or links (e.g. `/lead/{company_slug}`).
-- Form submission should POST to `/lead/{company_slug}` with `name`, `email`, optional `phone`, `message`, `meta`. It creates an `InboundEmail` row and triggers the same reply pipeline.
+Endpoints (admin routes require bearer token)
+---------------------------------------------
+- Auth: `POST /admin/login`
+- Clients: `GET/POST/PATCH /admin/clients`, `GET /admin/clients/{id}`, `GET /admin/clients/{id}/connection-status`, `POST /admin/clients/{id}/disconnect`
+- Connections: `POST /admin/clients/{id}/connect/google`, `POST /admin/clients/{id}/connect/microsoft`
+- Leads: `GET /admin/leads`, `GET /admin/leads/{lead_id}`, public `POST /lead/{company_slug}`
+- Webhooks: `POST /webhooks/gmail/push` (Gmail Pub/Sub), `POST /webhooks/microsoft/notifications` (Graph)
+- Health: `/health`, `/health/db`, `/health/providers`
 
 Notes
 -----
-- Inbound webhook validates `INBOUND_WEBHOOK_SECRET` and immediately returns 200 after storing the email.
-- Replies are idempotent via `(client_id, provider_message_id)` uniqueness.
-- Slack notifications fire when configured; failures trigger an alert.***
+- Tokens are encrypted (AES-GCM) via `ENCRYPTION_KEY`; HMAC-signed state used for OAuth.
+- Webhooks require secrets (Gmail: Pub/Sub audience + `GMAIL_WEBHOOK_SECRET`; Microsoft: `MICROSOFT_SUBSCRIPTION_CLIENT_STATE_SECRET`).
+- Job queue is DB-backed; polling every 5m; renewals every 30m with backoff on failures.
+- Scopes: Gmail `gmail.modify` + `gmail.send`; Microsoft `Mail.ReadWrite` + `Mail.Send`.
+- AI drafts: uses `OPENAI_API_KEY` if set; spam/unsafe guard prevents auto-send on obvious spam.
+
+Testing
+-------
+- Unit: `pytest -q` (integration with live providers not covered here).
+- Manual: connect a mailbox, send an email, verify lead stored, Slack (if configured), AI draft, and auto-reply from the connected account.***
