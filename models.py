@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import Optional
 
 from pydantic import EmailStr
-from sqlmodel import SQLModel, Field, Relationship
+from sqlmodel import SQLModel, Field
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.orm import relationship
 
 
 class ReplyMode(str, enum.Enum):
@@ -72,9 +73,9 @@ class Client(TimestampMixin, SQLModel, table=True):
     slack_webhook_url: Optional[str] = None
     reply_mode: ReplyMode = Field(default=ReplyMode.auto_send)
 
-    connections: list["MailboxConnection"] = Relationship("MailboxConnection", back_populates="client")
-    threads: list["EmailThread"] = Relationship("EmailThread", back_populates="client")
-    leads: list["Lead"] = Relationship("Lead", back_populates="client")
+    connections: list["MailboxConnection"] = relationship("MailboxConnection", back_populates="client")
+    threads: list["EmailThread"] = relationship("EmailThread", back_populates="client")
+    leads: list["Lead"] = relationship("Lead", back_populates="client")
 
 
 class MailboxConnection(TimestampMixin, SQLModel, table=True):
@@ -89,8 +90,8 @@ class MailboxConnection(TimestampMixin, SQLModel, table=True):
     last_sync_at: Optional[datetime] = None
     provider_metadata: Optional[str] = None
 
-    client: Client = Relationship("Client", back_populates="connections")
-    threads: list["EmailThread"] = Relationship("EmailThread", back_populates="connection")
+    client: Client = relationship("Client", back_populates="connections")
+    threads: list["EmailThread"] = relationship("EmailThread", back_populates="connection")
 
 
 class EmailThread(TimestampMixin, SQLModel, table=True):
@@ -103,10 +104,10 @@ class EmailThread(TimestampMixin, SQLModel, table=True):
     last_message_at: Optional[datetime] = None
     __table_args__ = (UniqueConstraint("client_id", "provider_thread_id", name="uq_client_thread"),)
 
-    client: Client = Relationship("Client", back_populates="threads")
-    connection: Optional[MailboxConnection] = Relationship("MailboxConnection", back_populates="threads")
-    messages: list["EmailMessage"] = Relationship("EmailMessage", back_populates="thread")
-    leads: list["Lead"] = Relationship("Lead", back_populates="thread")
+    client: Client = relationship("Client", back_populates="threads")
+    connection: Optional[MailboxConnection] = relationship("MailboxConnection", back_populates="threads")
+    messages: list["EmailMessage"] = relationship("EmailMessage", back_populates="thread")
+    leads: list["Lead"] = relationship("Lead", back_populates="thread")
 
 
 class EmailMessage(SQLModel, table=True):
@@ -126,7 +127,7 @@ class EmailMessage(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     __table_args__ = (UniqueConstraint("client_id", "provider_message_id", name="uq_client_message"),)
 
-    thread: Optional[EmailThread] = Relationship("EmailThread", back_populates="messages")
+    thread: Optional[EmailThread] = relationship("EmailThread", back_populates="messages")
 
 
 class Lead(TimestampMixin, SQLModel, table=True):
@@ -146,9 +147,9 @@ class Lead(TimestampMixin, SQLModel, table=True):
     error_ai: Optional[str] = None
     correlation_id: Optional[str] = Field(default=None, index=True)
 
-    client: Client = Relationship("Client", back_populates="leads")
-    thread: Optional[EmailThread] = Relationship("EmailThread", back_populates="leads")
-    drafts: list["AIDraft"] = Relationship("AIDraft", back_populates="lead")
+    client: Client = relationship("Client", back_populates="leads")
+    thread: Optional[EmailThread] = relationship("EmailThread", back_populates="leads")
+    drafts: list["AIDraft"] = relationship("AIDraft", back_populates="lead")
 
 
 class AIDraft(TimestampMixin, SQLModel, table=True):
@@ -159,7 +160,7 @@ class AIDraft(TimestampMixin, SQLModel, table=True):
     model_name: str
     sent_at: Optional[datetime] = None
 
-    lead: Lead = Relationship("Lead", back_populates="drafts")
+    lead: Lead = relationship("Lead", back_populates="drafts")
 
 
 class Job(TimestampMixin, SQLModel, table=True):
