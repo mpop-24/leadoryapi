@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import enum
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import EmailStr
 from sqlmodel import SQLModel, Field, Relationship
@@ -72,9 +70,9 @@ class Client(TimestampMixin, SQLModel, table=True):
     slack_webhook_url: Optional[str] = None
     reply_mode: ReplyMode = Field(default=ReplyMode.auto_send)
 
-    connections: list["MailboxConnection"] = Relationship("MailboxConnection", back_populates="client")
-    threads: list["EmailThread"] = Relationship("EmailThread", back_populates="client")
-    leads: list["Lead"] = Relationship("Lead", back_populates="client")
+    connections: List["MailboxConnection"] = Relationship(back_populates="client")
+    threads: List["EmailThread"] = Relationship(back_populates="client")
+    leads: List["Lead"] = Relationship(back_populates="client")
 
 
 class MailboxConnection(TimestampMixin, SQLModel, table=True):
@@ -89,8 +87,8 @@ class MailboxConnection(TimestampMixin, SQLModel, table=True):
     last_sync_at: Optional[datetime] = None
     provider_metadata: Optional[str] = None
 
-    client: Client = Relationship("Client", back_populates="connections")
-    threads: list["EmailThread"] = Relationship("EmailThread", back_populates="connection")
+    client: "Client" = Relationship(back_populates="connections")
+    threads: List["EmailThread"] = Relationship(back_populates="connection")
 
 
 class EmailThread(TimestampMixin, SQLModel, table=True):
@@ -103,10 +101,10 @@ class EmailThread(TimestampMixin, SQLModel, table=True):
     last_message_at: Optional[datetime] = None
     __table_args__ = (UniqueConstraint("client_id", "provider_thread_id", name="uq_client_thread"),)
 
-    client: Client = Relationship("Client", back_populates="threads")
-    connection: Optional[MailboxConnection] = Relationship("MailboxConnection", back_populates="threads")
-    messages: list["EmailMessage"] = Relationship("EmailMessage", back_populates="thread")
-    leads: list["Lead"] = Relationship("Lead", back_populates="thread")
+    client: "Client" = Relationship(back_populates="threads")
+    connection: Optional["MailboxConnection"] = Relationship(back_populates="threads")
+    messages: List["EmailMessage"] = Relationship(back_populates="thread")
+    leads: List["Lead"] = Relationship(back_populates="thread")
 
 
 class EmailMessage(SQLModel, table=True):
@@ -126,7 +124,7 @@ class EmailMessage(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     __table_args__ = (UniqueConstraint("client_id", "provider_message_id", name="uq_client_message"),)
 
-    thread: Optional[EmailThread] = Relationship("EmailThread", back_populates="messages")
+    thread: Optional["EmailThread"] = Relationship(back_populates="messages")
 
 
 class Lead(TimestampMixin, SQLModel, table=True):
@@ -146,9 +144,9 @@ class Lead(TimestampMixin, SQLModel, table=True):
     error_ai: Optional[str] = None
     correlation_id: Optional[str] = Field(default=None, index=True)
 
-    client: Client = Relationship("Client", back_populates="leads")
-    thread: Optional[EmailThread] = Relationship("EmailThread", back_populates="leads")
-    drafts: list["AIDraft"] = Relationship("AIDraft", back_populates="lead")
+    client: "Client" = Relationship(back_populates="leads")
+    thread: Optional["EmailThread"] = Relationship(back_populates="leads")
+    drafts: List["AIDraft"] = Relationship(back_populates="lead")
 
 
 class AIDraft(TimestampMixin, SQLModel, table=True):
@@ -159,7 +157,7 @@ class AIDraft(TimestampMixin, SQLModel, table=True):
     model_name: str
     sent_at: Optional[datetime] = None
 
-    lead: Lead = Relationship("Lead", back_populates="drafts")
+    lead: "Lead" = Relationship(back_populates="drafts")
 
 
 class Job(TimestampMixin, SQLModel, table=True):
