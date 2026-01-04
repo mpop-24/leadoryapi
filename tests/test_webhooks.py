@@ -18,27 +18,27 @@ from main import app
 
 
 def test_gmail_webhook_no_auth():
-    client = TestClient(app)
-    payload = {
-        "message": {
-            "data": base64.b64encode(json.dumps({"emailAddress": "test@example.com", "historyId": "1"}).encode()).decode()
+    with TestClient(app) as client:
+        payload = {
+            "message": {
+                "data": base64.b64encode(json.dumps({"emailAddress": "test@example.com", "historyId": "1"}).encode()).decode()
+            }
         }
-    }
-    resp = client.post("/webhooks/gmail/push", json=payload)
-    assert resp.status_code == 401  # secret required
+        resp = client.post("/webhooks/gmail/push", json=payload)
+        assert resp.status_code == 401  # secret required
 
 
 def test_ms_validation_token():
-    client = TestClient(app)
-    resp = client.post("/webhooks/microsoft/notifications?validationToken=abc", json={})
-    assert resp.status_code == 200
-    assert resp.text == '"abc"'
+    with TestClient(app) as client:
+        resp = client.post("/webhooks/microsoft/notifications?validationToken=abc", json={})
+        assert resp.status_code == 200
+        assert resp.text == '"abc"'
 
 
 def test_ms_notifications_unauthorized():
-    client = TestClient(app)
-    resp = client.post(
-        "/webhooks/microsoft/notifications",
-        json={"value": [{"subscriptionId": "sub1", "clientState": "bad", "resourceData": {"id": "msg"}}]},
-    )
-    assert resp.status_code == 401
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhooks/microsoft/notifications",
+            json={"value": [{"subscriptionId": "sub1", "clientState": "bad", "resourceData": {"id": "msg"}}]},
+        )
+        assert resp.status_code == 401
