@@ -4,6 +4,7 @@ import os
 
 from fastapi import APIRouter, Depends
 from sqlmodel import Session
+from sqlalchemy import text
 
 from db import get_db
 
@@ -18,7 +19,7 @@ async def health():
 @router.get("/health/db")
 async def health_db(session: Session = Depends(get_db)):
     try:
-        session.exec("SELECT 1")
+        session.exec(text("SELECT 1"))
         return {"ok": True}
     except Exception as exc:  # pragma: no cover
         return {"ok": False, "error": str(exc)}
