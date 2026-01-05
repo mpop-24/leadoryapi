@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import create_engine
@@ -28,7 +27,6 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, class_=Session)
 
 
-@contextmanager
 def get_db() -> Iterator[Session]:
     session: Session = SessionLocal()
     try:
